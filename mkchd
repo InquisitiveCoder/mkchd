@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+
+readonly script_name="mkchd"
+readonly version="1.0.0"
+
+show_usage() {
+	cat >&2 <<-EOF
+		Usage: ${script_name} CUE_FILE
+		   or: ${script_name} CHD_FILE
+		
+		Converts a CD to CHD format compressed with zstd + FLAC.
+		The hunk size is also reduced from 8 to 4 sectors, which is required
+		to decompress quickly enough for x8 CD speed on MiSTer FPGA.
+		The input file(s) will be removed (if BIN/CUE) or replaced (if CHD).
+		chdman v0.262 or higher must be in your PATH.
+		
+		Environment varibles:
+		  TMPDIR: directory for temporary files (default: /tmp)
+		
+		Examples:
+		  Compress a bin/cue disc:
+		  ${script_name} "/path/to/Disc.cue"
+		
+		  Recompress a CHD:
+		  ${script_name} "/path/to/Disc.chd"
+		
+		  Convert all discs in the current directory:
+		  for file in *.cue; do ${script_name} "\${file}"; done
+		
+		  Convert all discs in the current directory and subdirectories:
+		  find . -name '*.cue' -execdir ${script_name} '{}' ';'
+
+		${script_name} v${version}
+		https://github.com/InquisitiveCoder/mkchd
+	EOF
+	return 2
+}
+
+if [[ -z "$1" ]] || (( "$#" != 1 )); then
+	show_usage
+	exit
+fi
+
+# Prints 128 bits of randomness encoded in hex.
+hex_pseudo_uuid() {
+	local uuid && uuid=$(od -N16 -w16 -An -tx1 /dev/urandom | tr -d ' ')
+	# The only way to tell if `od` failed is to check ${uuid}
+	[[ -n "${uuid}" ]] && echo "${uuid}"
+}
+
+disc_name=$(basename "${1%.???}") && readonly disc_name || exit
+output_dir=$(dirname "$1") && readonly output_dir || exit
+temp_name="${script_name}_$(hex_pseudo_uuid)" && readonly temp_name || exit
+
+readonly temp_dir="${TMPDIR:-/tmp}/${temp_name}"
+# `chdman extractcd` seems to have issues with apostrophes in the output file
+# when running in Git Bash, so don't use ${disc_name} in temp_cue.
+readonly temp_cue="${temp_dir}/disc.cue";
+
+# Extracts a CD from a CHD to ${temp_cue}.
+# $1: the CHD file
+# stderr: the output from chdman
+extractcd() {
+	# shellcheck disable=SC2064
+	trap "rm -r -f '${temp_dir}'" EXIT
+	mkdir -p "${temp_dir}" || return
+	chdman extractcd -i "$1" -o "${temp_cue}" >&2 || return
+}
+
+# Converts a CD image to a CHD in ${output_dir}
+# $1: the cue file
+createcd() {
+	# Create the CHD with a temporary name in the same dir as the input file.
+	# If the script is interrupted, the signal handler will remove the
+	# incomplete file. Otherwise, the file is renamed, which will atomically
+	# replace the input file if it was a CHD.
+	local -r temp_chd="${output_dir}/${temp_name}.tmp"
+	# shellcheck disable=SC2064
+	trap "rm -f '${temp_chd}'" EXIT
+	chdman createcd -f -c cdzs,cdfl -hs 9792 -i "$1" -o "${temp_chd}" || return
+	mv -v -f "${temp_chd}" "${output_dir}/${disc_name}.chd"
+}
+
+# Deletes a cue file and its data files.
+# $1: the cue file
+rmbincue() {
+	# Parse the cue file for the names of the data files.
+	local cue_dir && cue_dir=$(dirname "$1") || return
+	local bin_files && bin_files=$(
+		sed -E -n 's/FILE "([^"]+)" .*/\1/p' "$1" \
+		| while IFS= read -r filename; do
+			echo "${cue_dir}/${filename}"
+		done
+	)
+	[[ -n "${bin_files}" ]] || return
+	xargs -d '\n' rm -v -f -- "$1" <<<"${bin_files}"
+}
+
+case "$1" in
+*.cue|*.CUE)
+	createcd "$1" || exit
+	rmbincue "$1"
+	;;
+*.chd|*.CHD)
+	extractcd "$1" || exit
+	createcd "${temp_cue}"
+	;;
+*) # Unsupported file format
+	show_usage
+	exit
+	;;
+esac
